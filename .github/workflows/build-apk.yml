@@ -91,7 +91,6 @@ jobs:
               appVersionCode: 1,
               shortcuts: [],
               generatorApp: "website-to-apk-builder",
-              webManifestUrl: start.origin + "/manifest.webmanifest",
               fallbackType: "customtabs",
               features: {},
               alphaDependencies: { enabled: false },
