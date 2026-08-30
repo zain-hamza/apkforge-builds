@@ -1,0 +1,167 @@
+name: Build APK
+
+run-name: apk-${{ github.event.client_payload.buildId }}
+
+on:
+  repository_dispatch:
+    types: [build-apk]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build signed APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Bubblewrap
+        run: npm install -g @bubblewrap/cli@latest
+
+      - name: Point Bubblewrap at the preinstalled JDK and Android SDK
+        run: |
+          mkdir -p "$HOME/.bubblewrap"
+          printf '{"jdkPath":"%s","androidSdkPath":"%s"}\n' "$JAVA_HOME" "$ANDROID_HOME" \
+            > "$HOME/.bubblewrap/config.json"
+          cat "$HOME/.bubblewrap/config.json"
+
+      - name: Write project manifests
+        working-directory: ${{ runner.temp }}
+        env:
+          CONFIG_JSON: ${{ toJSON(github.event.client_payload.config) }}
+        run: |
+          mkdir -p twa && cd twa
+          printf '%s' "$CONFIG_JSON" > config.json
+          node -e '
+            const fs = require("fs");
+            const c = JSON.parse(fs.readFileSync("config.json", "utf8"));
+            const start = new URL(c.url);
+            const host = start.hostname;
+            const display = c.fullscreen ? "fullscreen" : "standalone";
+
+            fs.writeFileSync("manifest.webmanifest", JSON.stringify({
+              name: c.appName,
+              short_name: c.shortName,
+              start_url: start.toString(),
+              scope: start.origin + "/",
+              display,
+              orientation: c.orientation,
+              theme_color: c.themeColor,
+              background_color: c.backgroundColor,
+              icons: [{ src: c.iconUrl, sizes: "512x512", type: "image/png", purpose: "any" }],
+            }, null, 2));
+
+            fs.writeFileSync("twa-manifest.json", JSON.stringify({
+              packageId: c.packageId,
+              host,
+              name: c.appName,
+              launcherName: c.shortName,
+              display,
+              orientation: c.orientation,
+              themeColor: c.themeColor,
+              themeColorDark: "#000000",
+              navigationColor: c.themeColor,
+              navigationColorDark: "#000000",
+              navigationDividerColor: "#000000",
+              navigationDividerColorDark: "#000000",
+              backgroundColor: c.backgroundColor,
+              enableNotifications: false,
+              startUrl: start.pathname + start.search,
+              iconUrl: c.iconUrl,
+              maskableIconUrl: c.iconUrl,
+              splashScreenFadeOutDuration: 300,
+              signingKey: { path: "./android.keystore", alias: "android" },
+              appVersionName: "1.0.0",
+              appVersionCode: 1,
+              shortcuts: [],
+              generatorApp: "website-to-apk-builder",
+              webManifestUrl: start.origin + "/manifest.webmanifest",
+              fallbackType: "customtabs",
+              features: {},
+              alphaDependencies: { enabled: false },
+              enableSiteSettingsShortcut: true,
+              isChromeOSOnly: false,
+              isMetaQuest: false,
+              fullScopeUrl: start.origin + "/",
+              minSdkVersion: 21,
+              fingerprints: [],
+              additionalTrustedOrigins: [],
+              retainedBundles: [],
+              protocolHandlers: [],
+              fileHandlers: [],
+              launchHandlerClientMode: "auto",
+            }, null, 2));
+          '
+          cat twa-manifest.json
+
+      - name: Generate signing keystore
+        working-directory: ${{ runner.temp }}/twa
+        run: |
+          keytool -genkeypair -v \
+            -keystore android.keystore \
+            -alias android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android \
+            -dname "CN=Website to APK Builder, OU=Build, O=Build, L=NA, S=NA, C=US"
+
+      - name: Generate Android project
+        working-directory: ${{ runner.temp }}/twa
+        env:
+          BUBBLEWRAP_KEYSTORE_PASSWORD: android
+          BUBBLEWRAP_KEY_PASSWORD: android
+        run: bubblewrap update --skipVersionUpgrade
+
+      - name: Build and sign the APK
+        working-directory: ${{ runner.temp }}/twa
+        env:
+          BUBBLEWRAP_KEYSTORE_PASSWORD: android
+          BUBBLEWRAP_KEY_PASSWORD: android
+        run: bubblewrap build --skipPwaValidation
+
+      - name: Collect the APK
+        id: collect
+        working-directory: ${{ runner.temp }}/twa
+        run: |
+          APK="$(find . -name '*-signed.apk' -o -name 'app-release*.apk' | head -n 1)"
+          if [ -z "$APK" ]; then
+            echo "No APK produced" >&2
+            exit 1
+          fi
+          SAFE_NAME="$(echo "${{ github.event.client_payload.config.shortName }}" \
+            | tr -cd '[:alnum:]-_' | head -c 24)"
+          [ -z "$SAFE_NAME" ] && SAFE_NAME="app"
+          cp "$APK" "$RUNNER_TEMP/${SAFE_NAME}.apk"
+          echo "apk_path=$RUNNER_TEMP/${SAFE_NAME}.apk" >> "$GITHUB_OUTPUT"
+
+      - name: Upload as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ github.event.client_payload.buildId }}
+          path: ${{ steps.collect.outputs.apk_path }}
+          retention-days: 30
+
+      - name: Publish release with the APK
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "apk-${{ github.event.client_payload.buildId }}" \
+            "${{ steps.collect.outputs.apk_path }}" \
+            --repo "${{ github.repository }}" \
+            --title "APK ${{ github.event.client_payload.config.appName }}" \
+            --notes "Built from ${{ github.event.client_payload.config.url }}"
